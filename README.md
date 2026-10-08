@@ -7,7 +7,7 @@ in **tmux** or **herdr**, and running it again changes nothing.
 
 ![compute sweep window: peek-tui charts, summary, raw log](docs/compute-window.svg)
 
-![agent swarm window, nine days into a campaign: spend, roster, open questions, task frontier](docs/swarm-window.svg)
+![a decompilation campaign twelve days in: seven models across six harnesses, cloud and local on GPUs, swimlanes by pipeline stage, open questions for the human, GPU and CPU load](docs/swarm-window.svg)
 
 *Real renders, not mockups: `python3 docs/capture.py` regenerates every image from the
 synthetic demo runs.*
@@ -31,7 +31,7 @@ git clone https://github.com/freakinfrick/compute-peek && cd compute-peek
 python3 compute-peek.py selftest
 tmux new -s main                     # any running tmux (or herdr) server
 python3 compute-peek.py demo                      # synthetic compute sweep
-python3 compute-peek.py demo --kind swarm --history 14d   # a two-week agent campaign
+python3 compute-peek.py demo --kind swarm --history 14d   # a decompilation campaign, two weeks in
 ```
 
 Requirements:
@@ -81,7 +81,8 @@ Requirements:
 |---|---|
 | any run | `title` `divider` `meter` `stage` `groups` `now` `last` `log` `stale` `thought` `footer` `group_table` `units` `raw` |
 | compute | `gpu` · `charts` (alone in a pane → peek-tui, a four-tab ratatui app) |
-| swarms | `roster` (agent states, time in state, spend) · `feed` (open questions/escalations first) · `cost` (budget bar, burn rate, projection) · `deps` (ready frontier, what's stuck behind a failure) |
+| swarms | `roster` (agent states, time in state, spend) · `feed` (open questions/escalations first) · `cost` (budget bar, burn rate, projection) · `deps` (ready frontier, what's stuck behind a failure) · `lanes` (per-agent swimlanes coloured by stage) |
+| hardware | `gpu` (names the local agents on each card) · `cpu` (per-core heat strip, load, memory) |
 
 <p>
 <img src="docs/peek-tui-atlas.svg" width="49%" alt="peek-tui atlas tab">

@@ -30,7 +30,7 @@ python3 $P selftest
 | the mux | `--mux` > `$PEEK_MUX` > spec `mux` > auto (in tmux → tmux, else running herdr, else running tmux) | SPEC §4 |
 
 Blocks — compute: `title` `divider` `meter` `stage` `groups` `now` `last` `gpu` `log` `stale`
-`thought` `footer` `group_table` `units` `charts` `raw`. Swarm: `roster` `feed` `cost` `deps`
+`thought` `footer` `group_table` `units` `charts` `raw`. Swarm: `roster` `feed` `cost` `deps` `lanes`; host: `cpu`
 (mix freely). Order by glance-value: **on fire / waiting on the human → how long left →
 what's running → per-group → last numbers → hardware or bill → raw log.**
 

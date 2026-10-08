@@ -185,7 +185,7 @@ grows:
 | `run_start` / `run_end` + `agent` | who worked the task | roster's current task, per-agent done count |
 | `run_end` + `status` | `ok` (default) · `failed` · `abandoned` | failed/abandoned count as finished, never unlock dependents, show ✗ |
 | **`plan`** | `units: [..]`, `groups: [..]`, `deps: {..}` appended mid-run | grows the plan and `n`; **never truncates** (§2 rule 1 is `sweep_start`'s alone) |
-| **`agent`** | `agent`, `state`, `task?`, `note?` | latest state per agent, with the time it was entered |
+| **`agent`** | `agent`, `state`, `task?`, `note?`; identity, sticky: `model?`, `harness?`, `gpu?` (label of a local model's card, e.g. `"GPU0"`), `host?` | latest state per agent, with the time it was entered; a bounded lane history of (state, task stage) |
 | **`message`** | `id`, `from`, `to?`, `kind`, `text`, `needs_human?`, `re?` | bounded feed; `re: <id>` resolves an earlier message |
 | **`usage`** | `agent`, `tokens`, `usd`, (`tokens_in`, `tokens_out`) — **cumulative** for that agent | latest wins per agent; totals are the sum |
 
@@ -276,11 +276,20 @@ progress moves in 1/8-cell steps. Reference for further widgets: ratatui upstrea
 | `feed` | header with the count of open messages (red when any needs the human), then every open message, then the latest messages, newest last, fitted to the pane | *is anyone waiting on me; what are they saying* |
 | `cost` | total tokens and $, a bar against `budget_usd`, burn rate over the rate window, projected total at finish (spend per finished task × remaining + spent), top spenders | *the bill, and where it is heading* |
 | `deps` | counts of done / running / ready / blocked / failed tasks, then the ready frontier, then tasks blocked by a failed dependency | *what unlocks next; what is stuck behind a failure* |
+| `lanes` | one swimlane per agent across the run (`lanes_window_s` to narrow it): working cells coloured by the task's stage, red waiting on the human, yellow blocked, a dash idle | *who did what, when; where the time went* |
+| `cpu` | host CPU bar, per-core heat strip, load, memory (Linux `/proc`; load only elsewhere) | *the CPU side of the compute* |
+
+`gpu` also names a swarm's local agents on the card they declared (`gpu: "GPU0"`), and `cost`
+splits local tokens ($0) from cloud spend and draws the spend over the run as a sparkline.
+
+Theme keys for swarms, all optional: `agent_icons` (`{name: icon}` or a list dealt out in name
+order), `state_icons` (`{state: icon}`), `kind_icons` (`{message kind: icon}`). Use
+double-width emoji; alignment counts terminal cells, not characters.
 
 `init --kind swarm` writes this window (all of it reorderable):
 
 ```
-summary:  title · divider · meter · cost · roster · stale · thought · footer
+summary:  title · divider · meter · stage · cost · roster · lanes · stale · thought · footer
 board:    feed · deps · group_table
 log:      raw   (the orchestrator, or `tail -F` of its log)
 ```

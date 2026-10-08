@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -62,7 +63,8 @@ DEFAULT_PANES = [
 # `init --kind swarm`: the window for agent runs (SPEC §3b).  Same rules, different blocks.
 SWARM_PANES = [
     {'name': 'summary',
-     'blocks': ['title', 'divider', 'meter', 'cost', 'roster', 'stale', 'thought', 'footer']},
+     'blocks': ['title', 'divider', 'meter', 'stage', 'cost', 'roster', 'lanes', 'stale',
+                'thought', 'footer']},
     {'name': 'board', 'blocks': ['feed', 'deps', 'group_table']},
     {'name': 'log', 'blocks': ['raw']},
 ]
@@ -121,6 +123,7 @@ def expand(paths) -> list[str]:
 FOLD_CKPT_MIN_BYTES = 1 << 20   # progress files past this get an on-disk fold checkpoint
 FEED_KEEP = 200                  # messages kept besides the open ones (spec: feed_keep)
 SERIES_MAX = 2000                # spend-history points; thinned evenly past this
+HIST_MAX = 400                   # state transitions kept per agent (the `lanes` block)
 OPEN_KINDS = ('question', 'escalation', 'stall')
 _FOLDS: dict = {}                # path -> {ino, off, first, st}: long-lived renderers fold deltas
 
@@ -139,7 +142,7 @@ def _agent(st: dict, name: str, ts) -> dict:
     a = st['agents'].get(name)
     if a is None:
         a = st['agents'][name] = {'state': 'idle', 'since': ts, 'task': None, 'note': '',
-                                  'last_ts': ts, 'done': 0}
+                                  'last_ts': ts, 'done': 0, 'hist': [[ts, 'idle', None]]}
     a['last_ts'] = ts or a['last_ts']
     return a
 
@@ -147,6 +150,16 @@ def _agent(st: dict, name: str, ts) -> dict:
 def _set_state(a: dict, state: str, ts) -> None:
     if state and state != a['state']:
         a['state'], a['since'] = state, ts
+
+
+def _mark(a: dict, ts) -> None:
+    """Append to the agent's lane history when (state, stage of its task) changes."""
+    grp = unit_group(a['task']) if a['state'] == 'working' and a.get('task') else None
+    h = a.setdefault('hist', [])
+    if not h or h[-1][1:] != [a['state'], grp]:
+        h.append([ts, a['state'], grp])
+        if len(h) > HIST_MAX:
+            del h[:len(h) - HIST_MAX]
 
 
 def _add_units(st: dict, units, groups=(), deps=None) -> None:
@@ -188,6 +201,7 @@ def _apply(st: dict, e: dict) -> None:
             a['task'] = u
             if a['state'] in ('idle', 'done'):
                 _set_state(a, 'working', ts)
+            _mark(a, ts)
     elif ev == 'run_end':
         u, who = e.get('unit'), e.get('agent')
         st['done'][u] = e
@@ -206,6 +220,7 @@ def _apply(st: dict, e: dict) -> None:
                 a['task'] = None
                 if a['state'] == 'working':
                     _set_state(a, 'idle', ts)
+                _mark(a, ts)
     elif ev == 'sweep_end':
         st['ended'] = True
         st['live'] = {}
@@ -218,6 +233,10 @@ def _apply(st: dict, e: dict) -> None:
             a['task'] = e['task']
         if 'note' in e:
             a['note'] = e['note'] or ''
+        for k in ('model', 'harness', 'gpu', 'host'):   # who this agent is; sticky
+            if e.get(k) is not None:
+                a[k] = e[k]
+        _mark(a, ts)
     elif ev == 'message':
         rec = {k: e.get(k) for k in ('id', 'from', 'to', 'kind', 're', 'needs_human')}
         rec['ts'], rec['text'] = ts, str(e.get('text', ''))[:400]
@@ -453,6 +472,26 @@ def spark(values, width: int = 40, lo: float | None = None, hi: float | None = N
     return ''.join(V_LEVELS[max(1, min(8, int(round((v - lo) / (hi - lo) * 8))))] for v in vs)
 
 
+def cells(text: str) -> int:
+    """Terminal cells, not characters: emoji and CJK take two."""
+    return sum(0 if unicodedata.combining(ch) or ch in '\ufe0f\u200d' else
+               2 if unicodedata.east_asian_width(ch) in 'WF' else 1 for ch in str(text))
+
+
+def pad(text: str, width: int) -> str:
+    return str(text) + ' ' * max(0, width - cells(text))
+
+
+def icon_for(theme: dict, key: str, name: str, default: str = '') -> str:
+    """theme[key] is {name: icon} or a list cycled by a stable hash of the name."""
+    v = theme.get(key)
+    if isinstance(v, dict):
+        return v.get(name, default)
+    if isinstance(v, list) and v:
+        return v[sum(map(ord, name)) % len(v)]
+    return default
+
+
 def done_in_order(st: dict) -> list[dict]:
     """Finished units by completion time (shards interleave)."""
     return sorted(st['done'].values(), key=lambda e: e.get('ts') or 0)
@@ -607,7 +646,17 @@ def blk_last(m, st, cx):
 
 
 def blk_gpu(m, st, cx):
-    return ['  ' + l for l in gpu_lines(m.get('_gpus'))]
+    """One line per device; a swarm's local agents (`gpu: "GPU<idx>"`) are named on their card."""
+    on = {}
+    for n, a in sorted(st['agents'].items()):
+        if a.get('gpu') is not None:
+            ico = _agent_icon(m, st, n)
+            on.setdefault(str(a['gpu']), []).append(f'{ico} {n}' if ico else n)
+    L = []
+    for line in gpu_lines(m.get('_gpus')):
+        label = line.split(' ', 1)[0]                     # 'GPU0'
+        L.append('  ' + line + (f'  {D}← {", ".join(on[label])}{X}' if label in on else ''))
+    return L
 
 
 def blk_log(m, st, cx):
@@ -692,8 +741,9 @@ def blk_charts(m, st, cx):
     for name, vs in series:
         xs = [v for v in vs if v is not None]
         if xs:
-            L.append(f'  {name[:12]:<13} {C}{spark(xs, width)}{X}  {D}{min(xs):.3g}…{max(xs):.3g}{X}'
-                     f'  last {B}{xs[-1]:.3g}{X}')
+            f = fmt_s if name == 'wall s' else (lambda v: f'{v:.3g}')
+            L.append(f'  {name[:12]:<13} {C}{spark(xs, width)}{X}  {D}{f(min(xs))}…{f(max(xs))}{X}'
+                     f'  last {B}{f(xs[-1])}{X}')
     return L
 
 
@@ -712,51 +762,135 @@ def _to_human(r: dict) -> bool:
     return bool(r.get('needs_human')) or r.get('to') == 'human'
 
 
+STATE_GLYPH = {'working': '▶', 'waiting_human': '!', 'blocked': '■', 'failed': '✗', 'idle': '·',
+               'done': '✓'}
+LANE_PALETTE = ['\033[38;5;39m', '\033[38;5;141m', '\033[38;5;43m', '\033[38;5;170m',
+                '\033[38;5;112m', '\033[38;5;75m']   # working cells, one colour per stage
+LANE_CELL = {'working': (C, '█'), 'waiting_human': (R, '█'), 'blocked': (Y, '▒'),
+             'failed': (R, '╳'), 'idle': (D, '─'), 'done': (G, '░')}
+
+
+def _agent_icon(m: dict, st: dict, name: str) -> str:
+    """theme.agent_icons: {name: icon} or a list dealt out in name order (no collisions)."""
+    v = m['theme'].get('agent_icons')
+    if isinstance(v, list) and v:
+        names = sorted(st['agents'])
+        return v[names.index(name) % len(v)] if name in names else ''
+    return icon_for(m['theme'], 'agent_icons', name)
+
+
+def _where(a: dict) -> str:
+    """'local GPU0' / 'cloud' from an agent's declared `gpu` / `host`."""
+    if a.get('gpu') is not None:
+        return f'⌂ {a["gpu"]}'
+    return a.get('host') or ''
+
+
 def blk_roster(m, st, cx):
     ag = st['agents']
     if not ag:
         return []
+    th = m['theme']
     stale = m.get('agent_stale_after_s') or m.get('stale_after_s') or 900
     rows = sorted(ag.items(), key=lambda kv: (STATE_ORDER.get(kv[1]['state'], 9), kv[0]))
     tally = {}
     for _, a in rows:
         tally[a['state']] = tally.get(a['state'], 0) + 1
-    L = [f'  {B}agents{X}  ' + ' · '.join(f'{STATE_COL.get(s, "")}{n} {s.replace("_", " ")}{X}'
-                                          for s, n in sorted(tally.items(),
-                                                             key=lambda t: STATE_ORDER.get(t[0], 9)))]
+    L = [f'  {B}agents{X}  ' + ' · '.join(
+        f'{STATE_COL.get(s, "")}{icon_for(th, "state_icons", s)}{n} {s.replace("_", " ")}{X}'
+        for s, n in sorted(tally.items(), key=lambda t: STATE_ORDER.get(t[0], 9)))]
     cap = max(4, cx['rows'] // 2)
-    taskw = max(12, min(40, cx['cols'] - 72))
+    icons = any(_agent_icon(m, st, n) for n in ag)
+    who_w = max(cells(n) for n in ag) + (3 if icons else 0)
+    mh = {n: ' @ '.join(x for x in (a.get('model'), a.get('harness')) if x) for n, a in ag.items()}
+    mh_w = min(36, max(map(cells, mh.values())))
+    wh_w = max(cells(_where(a)) for a in ag.values())
+    st_w = max(cells(icon_for(th, 'state_icons', s) + ' ' + s.replace('_', ' ')) for s in tally)
+    taskw = max(12, min(36, cx['cols'] - who_w - mh_w - wh_w - st_w - 44))
     for name, a in rows[:cap]:
         u = st['usage'].get(name, {})
         quiet = (not st['ended'] and a['state'] not in ('done', 'failed') and a['last_ts']
                  and cx['now'] - a['last_ts'] > stale)
+        ico = _agent_icon(m, st, name)
+        who = f'{ico} {name}' if icons else name
+        sic = icon_for(th, 'state_icons', a['state'])
+        state = (sic + ' ' if sic else '') + a['state'].replace('_', ' ')
         what = a['task'] or a['note'] or ''
-        L.append(f'  {Y + "? " if quiet else "  "}{X}{STATE_COL.get(a["state"], "")}'
-                 f'{a["state"].replace("_", " "):<13}{X} {name:<14.14} '
+        usd = u.get('usd') or 0
+        L.append(f'  {Y + "?" if quiet else " "}{X} {B}{pad(who, who_w)}{X}  '
+                 f'{D}{pad(_fit(mh[name], mh_w), mh_w)}  {pad(_where(a), wh_w)}{X}  '
+                 f'{STATE_COL.get(a["state"], "")}{pad(state, st_w)}{X} '
                  f'{fmt_s(cx["now"] - a["since"]) if a["since"] else "—":>8}  '
-                 f'{_fit(what, taskw):<{taskw}}  {D}{fmt_n(u.get("tokens")):>6} tok '
-                 f'{"$" + format(u.get("usd") or 0, ",.2f"):>9}  ✓{a["done"]}{X}')
+                 f'{pad(_fit(what, taskw), taskw)}  {D}{fmt_n(u.get("tokens")):>6} tok '
+                 f'{("$" + format(usd, ",.2f")) if usd else "local":>8}  ✓{a["done"]}{X}')
     if len(rows) > cap:
         L.append(f'{D}  … {len(rows) - cap} more agents{X}')
     return L
 
 
+def blk_lanes(m, st, cx):
+    """One swimlane per agent across the rate window, coloured by state (SPEC §3b)."""
+    ag = st['agents']
+    if not ag:
+        return []
+    th = m['theme']
+    w = float(m.get('lanes_window_s') or max(cx['elapsed'] or 0, 60))   # default: the run
+    icons = any(_agent_icon(m, st, n) for n in ag)
+    who_w = max(cells(n) for n in ag) + (3 if icons else 0)
+    width = max(10, cx['cols'] - who_w - 8)
+    t1 = st['last_ts'] if st['ended'] else cx['now']
+    t0 = t1 - w
+    step = w / width
+    L = [f'  {B}lanes{X}  {D}last {fmt_s(w)}  ' + '─' * max(0, width - 22 - len(fmt_s(w)))
+         + f' now{X}']
+    for name in sorted(ag):
+        h = ag[name].get('hist') or [[ag[name]['since'], ag[name]['state'], None]]
+        row, j, cur, grp, last = [], 0, None, None, None
+        for i in range(width):
+            t = t0 + (i + 0.5) * step
+            while j < len(h) and (h[j][0] or 0) <= t:
+                cur, grp = h[j][1], (h[j][2] if len(h[j]) > 2 else None)
+                j += 1
+            if cur is None:
+                row.append(' ')
+                continue
+            col, glyph = LANE_CELL.get(cur, (D, '·'))
+            if cur == 'working' and grp in st['groups']:
+                col = LANE_PALETTE[st['groups'].index(grp) % len(LANE_PALETTE)]
+            row.append((col if col != last else '') + glyph)
+            last = col
+        ico = _agent_icon(m, st, name)
+        L.append(f'  {pad(f"{ico} {name}" if icons else name, who_w)}  {"".join(row)}{X}')
+    used = {x[2] for a in ag.values() for x in a.get('hist', []) if len(x) > 2 and x[2]}
+    stages = [g for g in st['groups'] if g in used]
+    legend = ' '.join(f'{LANE_PALETTE[st["groups"].index(g) % len(LANE_PALETTE)]}██{X}{D} {g}{X}'
+                      for g in stages) or f'{C}██{X}{D} working{X}'
+    legend += '   ' + '  '.join(f'{LANE_CELL[s][0]}{LANE_CELL[s][1] * 2}{X}{D} '
+                                f'{icon_for(th, "state_icons", s)}{s.replace("_", " ")}{X}'
+                                for s in ('waiting_human', 'blocked', 'idle', 'done'))
+    return L + [f'  {"":<{who_w}}  {legend}']
+
+
 def blk_feed(m, st, cx):
     if not st['feed'] and not st['open']:
         return []
+    th = m['theme']
     opn = sorted(st['open'].values(), key=lambda r: r['ts'] or 0)
     human = sum(1 for r in opn if _to_human(r))
     head = f'  {B}feed{X}  '
     head += (f'{R}{B}{human} waiting on you{X} · ' if human else '') + \
         (f'{Y}{len(opn)} open{X}' if opn else f'{D}nothing open{X}')
     L = [head]
-    textw = max(20, cx['cols'] - 40)
+    textw = max(20, cx['cols'] - 44)
 
     def line(r, mark):
         age = fmt_s(cx['now'] - r['ts']) if r['ts'] else '—'
-        who = r.get('from') or '?'
-        to = f'→{r["to"]}' if r.get('to') else ''
-        return (f'  {mark} {D}{age:>7}{X} {_fit(who + to, 18):<18} {D}{r.get("kind") or "":<10}{X} '
+        frm = r.get('from') or '?'
+        ico = _agent_icon(m, st, frm) if frm in st['agents'] else ''
+        who = (f'{ico} ' if ico else '') + frm + (f'→{r["to"]}' if r.get('to') else '')
+        kic = icon_for(th, 'kind_icons', r.get('kind') or '')
+        kind = (kic + ' ' if kic else '') + (r.get('kind') or '')
+        return (f'  {mark} {D}{age:>7}{X} {pad(_fit(who, 20), 20)} {D}{pad(kind, 13)}{X} '
                 f'{_fit(r.get("text", ""), textw)}')
     for r in opn:
         L.append(line(r, f'{R}!{X}' if _to_human(r) else f'{Y}?{X}'))
@@ -775,8 +909,11 @@ def blk_cost(m, st, cx):
         return []
     usd = sum(u.get('usd') or 0 for u in us.values())
     tok = sum(u.get('tokens') or 0 for u in us.values())
+    local = [n for n, a in st['agents'].items() if a.get('gpu') is not None and n in us]
+    ltok = sum(us[n].get('tokens') or 0 for n in local)
     budget = m.get('budget_usd') or st['budget_usd']
-    L = [f'  {"cost":<13} {B}${usd:,.2f}{X} · {fmt_n(tok)} tokens · {len(us)} agents']
+    L = [f'  {"cost":<13} {B}${usd:,.2f}{X} · {fmt_n(tok)} tokens'
+         + (f' {D}({fmt_n(ltok)} local, $0){X}' if local else '') + f' · {len(us)} agents']
     if budget:
         f = usd / budget
         L[0] += f'   {bar(min(f, 1.0), 20, R if f > 0.9 else Y if f > 0.7 else G)} of ${budget:,.0f}'
@@ -794,10 +931,82 @@ def blk_cost(m, st, cx):
         bits.append(f'projected ${proj:,.2f} at finish{warn}')
     if bits:
         L.append(f'  {"":<13} ' + ' · '.join(bits))
+    if len(sp) > 2 and st['t0']:
+        # $ per slice of the run, as a sparkline: when did the money go?
+        width = max(10, min(60, cx['cols'] - 40))
+        t0, t1 = sp[0][0], sp[-1][0]
+        if t1 > t0:
+            edges = [t0 + (t1 - t0) * i / width for i in range(width + 1)]
+            vals, j, prev = [], 0, sp[0][1]
+            for e in edges[1:]:
+                while j < len(sp) and sp[j][0] <= e:
+                    j += 1
+                cur = sp[j - 1][1] if j else sp[0][1]
+                vals.append(max(0.0, cur - prev))
+                prev = cur
+            L.append(f'  {"":<13} {Y}{spark(vals, width, lo=0)}{X}  {D}$ over the run{X}')
     top = sorted(us.items(), key=lambda kv: -(kv[1].get('usd') or 0))[:3]
     if usd and len(us) > 1:
         L.append(f'  {"":<13} {D}top: ' + '  '.join(
-            f'{n} {100 * (u.get("usd") or 0) / usd:.0f}%' for n, u in top) + X)
+            f'{n} {100 * (u.get("usd") or 0) / usd:.0f}%' for n, u in top if u.get('usd')) + X)
+    return L
+
+
+_CPU_PREV: dict = {}
+
+
+def cpu_sample() -> dict | None:
+    """Host CPU from /proc (Linux): per-core busy %, load, memory.  None elsewhere.
+    $PEEK_CPU_SAMPLE names a JSON file of the same shape (screenshots, tests)."""
+    fake = os.environ.get('PEEK_CPU_SAMPLE')
+    if fake:
+        return json.loads(Path(fake).read_text())
+    try:
+        lines = Path('/proc/stat').read_text().splitlines()
+    except OSError:
+        return None
+    now = {}
+    for ln in lines:
+        if ln.startswith('cpu'):
+            f = ln.split()
+            v = list(map(int, f[1:8]))
+            now[f[0]] = (sum(v), v[3] + v[4])            # total, idle+iowait
+    if not _CPU_PREV:                                    # one-shot reader: take a short delta
+        _CPU_PREV.update(now)
+        time.sleep(0.15)
+        return cpu_sample()
+    busy = {}
+    for k, (tot, idle) in now.items():
+        pt, pi = _CPU_PREV.get(k, (tot, idle))
+        busy[k] = 100.0 * (1 - (idle - pi) / (tot - pt)) if tot > pt else 0.0
+    _CPU_PREV.clear()
+    _CPU_PREV.update(now)
+    mem = {}
+    try:
+        for ln in Path('/proc/meminfo').read_text().splitlines():
+            k, v = ln.split(':', 1)
+            mem[k] = int(v.split()[0]) / 1048576           # GiB
+    except OSError:
+        pass
+    cores = [busy[k] for k in sorted((k for k in busy if k != 'cpu'), key=lambda k: int(k[3:]))]
+    return {'all': busy.get('cpu', 0.0), 'cores': cores, 'load': os.getloadavg(),
+            'mem_used': mem.get('MemTotal', 0) - mem.get('MemAvailable', 0),
+            'mem_total': mem.get('MemTotal', 0)}
+
+
+def blk_cpu(m, st, cx):
+    c = cpu_sample()
+    if c is None:
+        la = os.getloadavg()
+        return [f'  {"cpu":<13} load {la[0]:.1f} {la[1]:.1f} {la[2]:.1f}']
+    n = len(c['cores'])
+    col = R if c['all'] > 90 else Y if c['all'] > 70 else G
+    L = [f'  {"cpu":<13} {bar(c["all"] / 100, 20, col)} {c["all"]:3.0f} % of {n} cores · '
+         f'load {c["load"][0]:.1f} · mem {c["mem_used"]:.0f}/{c["mem_total"]:.0f} GB']
+    # one cell per core, nine levels: a heat strip of the whole socket
+    width = max(10, cx['cols'] - 17)
+    strip = ''.join(V_LEVELS[max(1, min(8, int(round(v / 100 * 8))))] for v in c['cores'][:width])
+    L.append(f'  {"":<13} {col}{strip}{X}')
     return L
 
 
@@ -853,7 +1062,8 @@ BLOCKS = {'title': blk_title, 'divider': blk_divider, 'meter': blk_meter, 'stage
           'groups': blk_groups, 'now': blk_now, 'last': blk_last, 'gpu': blk_gpu,
           'log': blk_log, 'stale': blk_stale, 'thought': blk_thought, 'footer': blk_footer,
           'group_table': blk_group_table, 'units': blk_units, 'charts': blk_charts,
-          'roster': blk_roster, 'feed': blk_feed, 'cost': blk_cost, 'deps': blk_deps}
+          'roster': blk_roster, 'feed': blk_feed, 'cost': blk_cost, 'deps': blk_deps,
+          'lanes': blk_lanes, 'cpu': blk_cpu}
 
 
 def render_pane(m: dict, name: str, rows: int = 30, cols: int = 100) -> str:
@@ -1404,14 +1614,47 @@ def cmd_demo_feed(a) -> int:
         time.sleep(a.pause)
 
 
-DEMO_AGENTS = ['ada', 'grace', 'linus', 'barbara', 'ken', 'margaret', 'dennis', 'frances']
-DEMO_STEPS = {'design': 0.8, 'build': 1.6, 'test': 1.0, 'review': 0.5}   # step -> relative cost
-DEMO_QUESTIONS = ['should the cache key include the locale?', 'ok to bump the schema version?',
-                  'two specs disagree on retry limits — which wins?',
-                  'need a staging credential to run the e2e suite',
-                  'is the 200 ms budget p50 or p99?']
-DEMO_NOTES = ['waiting on CI', 'rate-limited by the API', 'merge conflict with main',
-              'flaky test, re-running']
+# The swarm demo is a decompilation campaign: every function of a binary flows
+# triage → lift → retype → name → match (recompiles byte-identical), worked by a mix of
+# cloud and local models in different harnesses.  Local models sit on GPUs; `match`
+# is CPU work (recompile + diff).  Names, prices and versions are illustrative.
+DEMO_AGENTS = [   # name, model, harness, gpu label (local) or None (cloud), $ per M tokens
+    ('opus', 'Claude Opus 5.5', 'claude-code', None, 15.0),
+    ('sonnet', 'Claude Sonnet 5.5', 'claude-code', None, 5.0),
+    ('gpt', 'GPT-6.1', 'codex', None, 6.0),
+    ('deepseek', 'DeepSeek 4 Pro', 'hermes', None, 1.1),
+    ('glm', 'GLM 5.3', 'opencode', None, 1.5),
+    ('qwen', 'Qwen 3.8 27B', 'pi', 'GPU0', 0.0),
+    ('gemma', 'Gemma 4 31B', 'omp', 'GPU1', 0.0),
+]
+DEMO_STEPS = {'triage': 0.4, 'lift': 1.4, 'retype': 1.0, 'name': 0.6, 'match': 1.2}
+DEMO_QUESTIONS = ['is this the PAL or the NTSC build? the frame timer differs',
+                  'symbol mangling looks like gcc 2.7 — can you confirm the toolchain?',
+                  'struct at 0x8009c3a0: player state or camera rig?',
+                  'jump table in {fn} needs the switch base — is there a map file?',
+                  'ok to rename the whole audio_* family? it touches 40 call sites']
+DEMO_ANSWERS = ['NTSC — the map file is in /ref', 'gcc 2.7.2 with -O2 -G0, per the build log',
+                'camera rig; player state lives at 0x8009d100', 'yes, rename the family',
+                'no map file — derive the switch base from the bounds check']
+DEMO_BLOCKS = ['objdiff waiting for a free CPU slot', 'ghidra re-analysing after a retype',
+               'GPU busy — queued behind another local model', 'rate-limited (429), backing off',
+               'two agents renamed the same struct — merging']
+DEMO_THEME = {
+    'icon': '🧩', 'meter_label': 'reassembled',
+    'stages': ['🥚 bytes', '🦴 skeleton', '🧠 meaning', '🏛  source'],
+    'thought_key': 'match',
+    'thoughts': [[0.0, 'mostly gibberish — the compiler is laughing at us'],
+                 [0.35, 'shapes in the fog: a state machine, a suspicious memcpy'],
+                 [0.6, 'it reads like a human wrote it'],
+                 [0.85, 'nearly byte-perfect — the matching gods smile'],
+                 [0.99, '🏆 100 % match — ship the source']],
+    'agent_icons': {'opus': '🦉', 'sonnet': '🎻', 'gpt': '📜', 'deepseek': '🐋',
+                    'glm': '🐼', 'qwen': '🐉', 'gemma': '💎', 'human': '🧑'},
+    'state_icons': {'working': '🔧', 'waiting_human': '🙋', 'blocked': '🧱', 'idle': '💤',
+                    'done': '🏁', 'failed': '💥'},
+    'kind_icons': {'claim': '✋', 'answer': '💬', 'question': '❓', 'escalation': '🚨',
+                   'stall': '🐌', 'note': '📝'},
+}
 
 
 def parse_dur(s: str) -> float:
@@ -1422,28 +1665,34 @@ def parse_dur(s: str) -> float:
 
 
 def cmd_demo_swarm_feed(a) -> int:
-    """A synthetic agent swarm (SPEC §2b): features flow design → build → test → review
-    through a pool of agents who sometimes need the human, get blocked, fail, and grow the
-    plan.  `--history 14d` back-fills two weeks of events instantly, then runs live."""
+    """A synthetic decompilation campaign (SPEC §2b).  `--history 14d` back-fills two
+    weeks of events instantly, then runs live; `--until-now` stops after the back-fill."""
     import heapq
     import random
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from peek_progress import Progress
     rnd = random.Random(a.seed)
-    feats = [f'f{i:02d}' for i in range(max(1, a.tasks // len(DEMO_STEPS)))]
-    units, deps = [], {}
+    units, deps, addrs = [], {}, set()
 
-    def add_feature(f):
-        prev = None
+    def add_function():
+        while True:
+            fn = f'fn_{0x80010000 + rnd.randrange(0, 0x40000) * 4:08x}'
+            if fn not in addrs:
+                addrs.add(fn)
+                break
+        prev, new = None, []
         for step in DEMO_STEPS:
-            u = f'{step}={f}'
+            u = f'{step}={fn}'
             units.append(u)
+            new.append(u)
             if prev:
                 deps[u] = [prev]
             prev = u
-    for f in feats:
-        add_feature(f)
+        return fn, new
+    for _ in range(max(1, a.tasks // len(DEMO_STEPS))):
+        add_function()
     agents = DEMO_AGENTS[:a.agents]
+    info = {n: (mdl, h, g, price) for n, mdl, h, g, price in agents}
     hist = parse_dur(a.history)
     mean_cost = sum(DEMO_STEPS.values()) / len(DEMO_STEPS)
     unit_s = (hist * len(agents) / (len(units) * mean_cost * 0.7 * 1.6)) if hist else a.every
@@ -1451,33 +1700,41 @@ def cmd_demo_swarm_feed(a) -> int:
     vt = now0 - hist
     p = Progress(a.progress, eta=False)
     p.sweep_start(units, list(DEMO_STEPS), deps=deps, budget_usd=a.budget,
-                  meta={'demo': 'swarm'}, ts=vt)
-    free, started, ok = set(agents), set(), set()
-    tok = {n: 0 for n in agents}
+                  meta={'demo': 'decomp', 'binary': 'retro_game.elf'}, ts=vt)
+    for n, (mdl, h, g, _) in info.items():
+        p.agent(n, 'idle', model=mdl, harness=h, gpu=g, host=None if g else 'cloud', ts=vt)
+    free, started, ok, matched = {n for n, *_ in agents}, set(), set(), set()
+    tok = {n: 0 for n in info}
     heap, seq, live = [], itertools.count(), not hist
 
     def push(t, *ev):
         heapq.heappush(heap, (t, next(seq), *ev))
+
+    def binary_match() -> float:   # share of functions that recompile byte-identical
+        return round(len(matched) / max(1, len(addrs)), 4)
     while True:
         ready = [u for u in units if u not in started and all(d in ok for d in deps.get(u, []))]
-        for name in sorted(free):
-            if not ready:
+        # local models take the volume steps; the big cloud models take retype/match
+        for name in sorted(free, key=lambda n: (info[n][2] is None, n)):
+            pick = next((u for u in ready if (info[name][2] is None) ==
+                         (u.split('=')[0] in ('retype', 'match'))), ready[0] if ready else None)
+            if pick is None:
                 break
-            u = ready.pop(0)
+            ready.remove(pick)
             free.discard(name)
-            started.add(u)
-            p.agent(name, 'working', task=u, ts=vt)
-            p.run_start(u, agent=name, ts=vt)
-            if rnd.random() < 0.3:
-                p.message(name, 'claim', f'taking {u}', ts=vt)
-            push(vt + unit_s * DEMO_STEPS[u.split('=')[0]] * rnd.uniform(0.6, 1.5), 'end', name, u)
+            started.add(pick)
+            p.agent(name, 'working', task=pick, ts=vt)
+            p.run_start(pick, agent=name, ts=vt)
+            if rnd.random() < 0.25:
+                p.message(name, 'claim', f'taking {pick}', ts=vt)
+            cost = DEMO_STEPS[pick.split('=')[0]] * (1.4 if info[name][2] else 1.0)
+            push(vt + unit_s * cost * rnd.uniform(0.6, 1.5), 'end', name, pick)
         if not heap:
             break
         t, _, kind, name, arg = heapq.heappop(heap)
         if not live and t >= now0:
             if a.until_now:
                 break
-            # back-fill done: squeeze what is in flight onto the live clock
             live, scale = True, a.every / unit_s
             heap = [(now0 + (x[0] - now0) * scale, *x[1:]) for x in heap] + \
                 [(now0 + (t - now0) * scale, 0, kind, name, arg)]
@@ -1488,52 +1745,95 @@ def cmd_demo_swarm_feed(a) -> int:
             time.sleep(t - time.time())
         vt = t
         if kind == 'end':
-            step = arg.split('=')[0]
-            failed = rnd.random() < 0.05
-            tok[name] += int(DEMO_STEPS[step] * rnd.uniform(20_000, 90_000))
-            p.usage(name, tokens=tok[name], usd=tok[name] * 9e-6, ts=vt)
-            p.run_end(arg, agent=name, status='failed' if failed else 'ok', ts=vt)
-            print(f'{p.k}/{p.n} done  {name:<9} {"FAILED " if failed else ""}{arg}', flush=True)
+            step, fn = arg.split('=')
+            failed = rnd.random() < (0.12 if step == 'match' else 0.03)
+            used = int(DEMO_STEPS[step] * rnd.uniform(30_000, 120_000))
+            tok[name] += used
+            p.usage(name, tokens=tok[name], usd=tok[name] * info[name][3] / 1e6, ts=vt)
+            fm = None
+            if step == 'match':
+                fm = round(rnd.uniform(0.9, 0.995) if failed else 1.0, 4)
+                if not failed:
+                    matched.add(fn)
+            metrics = {'match': binary_match(), 'tokens_k': round(used / 1000, 1)}
+            if fm is not None:
+                metrics['fn_match'] = fm
+            p.run_end(arg, agent=name, status='failed' if failed else 'ok', metrics=metrics,
+                      ts=vt)
+            print(f'{p.k}/{p.n} done  {name:<9} {"FAILED " if failed else ""}{arg}'
+                  f'  binary match {metrics["match"]:.1%}', flush=True)
             if failed:
-                e = p.message(name, 'escalation', f'{arg} failed twice; needs a look', ts=vt)
+                e = p.message(name, 'escalation',
+                              f'{fn} stuck at {fm:.1%} — compiler flags?' if fm else
+                              f'{arg} failed: lifter produced invalid C', ts=vt)
                 if rnd.random() < 0.7:
                     push(vt + unit_s * rnd.uniform(2, 8), 'triage', name, e)
             else:
                 ok.add(arg)
-                if step == 'review' and rnd.random() < 0.15:
-                    f = f'f{len(units) // len(DEMO_STEPS):02d}'
-                    before = len(units)
-                    add_feature(f)
-                    new = units[before:]
+                if step == 'lift' and rnd.random() < 0.18:
+                    callee, new = add_function()
                     p.plan(new, deps={u: deps[u] for u in new if u in deps}, ts=vt)
-                    p.message(name, 'note', f'review found follow-up work: feature {f}', ts=vt)
+                    p.message(name, 'note', f'xref: {fn} calls unseen {callee}', ts=vt)
             r = rnd.random()
-            if r < 0.10:
-                q = p.message(name, 'question', rnd.choice(DEMO_QUESTIONS), to='human',
-                              needs_human=True, ts=vt)
+            if r < 0.08:
+                q = p.message(name, 'question', rnd.choice(DEMO_QUESTIONS).format(fn=fn),
+                              to='human', needs_human=True, ts=vt)
                 p.agent(name, 'waiting_human', note='asked the human', ts=vt)
                 push(vt + unit_s * rnd.uniform(1, 4), 'answer', name, q)
-            elif r < 0.18:
-                p.agent(name, 'blocked', note=rnd.choice(DEMO_NOTES), ts=vt)
+            elif r < 0.14 and info[name][2]:
+                s = p.message(name, 'stall', f'context overflow on {fn}, retrying in chunks',
+                              ts=vt)
+                p.agent(name, 'blocked', note='context overflow', ts=vt)
+                push(vt + unit_s * rnd.uniform(0.5, 2), 'unstall', name, s)
+            elif r < 0.20:
+                p.agent(name, 'blocked', note=rnd.choice(DEMO_BLOCKS), ts=vt)
                 push(vt + unit_s * rnd.uniform(0.5, 2), 'unblock', name, None)
             else:
                 p.agent(name, 'idle', ts=vt)
-                free.add(name)
+                push(vt + unit_s * rnd.uniform(0.05, 0.6), 'free', name, None)   # think time
+        elif kind == 'free':
+            free.add(name)
         elif kind == 'answer':
-            p.message('human', 'answer', 'go with the simpler option', to=name, re=arg, ts=vt)
+            p.message('human', 'answer', rnd.choice(DEMO_ANSWERS), to=name, re=arg, ts=vt)
             p.agent(name, 'idle', ts=vt)
             free.add(name)
         elif kind == 'triage':
-            p.message('human', 'answer', 'triaged — dropping it from this campaign', re=arg, ts=vt)
+            p.message('human', 'answer', 'parking it; revisit after the struct pass', re=arg,
+                      ts=vt)
+        elif kind == 'unstall':
+            p.message(name, 'note', 'chunked retry worked', re=arg, ts=vt)
+            p.agent(name, 'idle', ts=vt)
+            free.add(name)
         elif kind == 'unblock':
             p.agent(name, 'idle', ts=vt)
             free.add(name)
     if not a.until_now:
-        for name in agents:
+        for name in info:
             p.agent(name, 'done', ts=vt)
-        p.sweep_end(out='(demo: nothing written)', ts=vt)
-        print('swarm finished', flush=True)
+        p.sweep_end(out='src/ (demo: nothing written)', ts=vt)
+        print('campaign finished', flush=True)
     return 0
+
+
+def demo_swarm_spec(cwd: str, command: str | None, gpus: list) -> dict:
+    """The decompilation-campaign window: four panes, every swarm block, GPU + CPU."""
+    return {
+        'title': 'decomp campaign · retro_game.elf · cloud + local models, six harnesses',
+        'workspace': 'peek-swarm', 'cwd': cwd, 'progress': 'swarm.jsonl', 'log': 'swarm.log',
+        'command': command, 'gpu': gpus, 'every': 2, 'stale_after_s': 6 * 3600,
+        'agent_stale_after_s': 12 * 3600, 'budget_usd': 150,
+        'metrics': ['match', 'fn_match', 'tokens_k'],
+        'failure_patterns': DEFAULT_FAILURES,
+        'panes': [
+            {'name': 'summary', 'blocks': ['title', 'divider', 'meter', 'stage', 'cost',
+                                           'roster', 'lanes', 'stale', 'thought', 'footer']},
+            {'name': 'board', 'dir': 'down', 'ratio': 0.5,
+             'blocks': ['feed', 'deps', 'group_table']},
+            {'name': 'compute', 'dir': 'right', 'ratio': 0.6,
+             'blocks': ['gpu', 'cpu', 'charts', 'log']},
+            {'name': 'log', 'dir': 'down', 'ratio': 0.5, 'blocks': ['raw']}],
+        'theme': DEMO_THEME,
+    }
 
 
 def cmd_demo(a) -> int:
@@ -1547,17 +1847,11 @@ def cmd_demo(a) -> int:
         uuids = []
     me, py = shlex.quote(str(Path(__file__).resolve())), shlex.quote(sys.executable)
     if a.kind == 'swarm':
-        return _launch_demo(a, d, {
-            'title': f'demo swarm · {a.agents} agents · features: design → build → test → review',
-            'workspace': a.workspace if a.workspace != 'peek-demo' else 'peek-swarm',
-            'cwd': str(d), 'panes': [dict(x) for x in SWARM_PANES],
-            'progress': 'swarm.jsonl', 'log': 'swarm.log',
-            'command': f'{py} -u {me} demo-feed --swarm --progress swarm.jsonl --every {a.every} '
-                       f'--history {a.history} --agents {a.agents} --tasks {a.tasks}',
-            'every': 1, 'stale_after_s': 120, 'budget_usd': 60,
-            'theme': {'icon': '🐝', 'meter_label': 'hive', 'stages': ['scouting', 'building',
-                                                                     'buzzing', 'honey']},
-        }, 'swarm.json', tui=False)
+        spec = demo_swarm_spec(
+            str(d), f'{py} -u {me} demo-feed --swarm --progress swarm.jsonl --every {a.every} '
+                    f'--history {a.history} --agents {a.agents} --tasks {a.tasks}', uuids)
+        spec['workspace'] = a.workspace if a.workspace != 'peek-demo' else 'peek-swarm'
+        return _launch_demo(a, d, spec, 'swarm.json', tui=False)
     spec = {
         'title': 'showcase sweep · 4 groups × 4 values × 3 seeds', 'workspace': a.workspace,
         'cwd': str(d),
@@ -1680,6 +1974,10 @@ def _selftest_swarm(d: Path) -> None:
         (st['n'], st['k'], st['agents'], st['usage'])
     for name in ('summary', 'board'):
         assert render_pane(m, name, 30, 120).strip()
+    m['panes'].append({'name': 'hw', 'blocks': ['lanes', 'cpu', 'gpu']})
+    lanes = render_pane(m, 'hw', 20, 100)
+    assert 'lanes' in lanes and 'cpu' in lanes, lanes
+    assert cells('🐝a') == 3 and pad('🐝', 4) == '🐝  '
     assert 'over budget' in render_pane(m, 'summary', 30, 120)   # $3 per task × 4 > $10
     # truncate-and-regrow between reads restarts the fold
     pr.sweep_start(['z=1'], ts=t + 1000)
@@ -1764,7 +2062,7 @@ def main(argv=None) -> int:
     s.add_argument('--pause', type=float, default=8.0, help='seconds between sweeps')
     s.add_argument('--no-loop', dest='loop', action='store_false')
     s.add_argument('--swarm', action='store_true', help='an agent swarm instead (SPEC §2b)')
-    s.add_argument('--agents', type=int, default=6)
+    s.add_argument('--agents', type=int, default=7)
     s.add_argument('--tasks', type=int, default=40)
     s.add_argument('--history', default='0', help='swarm: back-fill this much past (14d, 6h)')
     s.add_argument('--until-now', action='store_true', help='swarm: stop after the back-fill')
@@ -1778,7 +2076,7 @@ def main(argv=None) -> int:
     s.add_argument('--mux', choices=[*MUXES, 'auto'], default=None)
     s.add_argument('--kind', choices=['compute', 'swarm'], default='compute')
     s.add_argument('--history', default='0', help='swarm: back-fill (e.g. 14d) then go live')
-    s.add_argument('--agents', type=int, default=6)
+    s.add_argument('--agents', type=int, default=7)
     s.add_argument('--tasks', type=int, default=40)
     s.set_defaults(fn=cmd_demo)
 

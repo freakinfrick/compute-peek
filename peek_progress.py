@@ -18,7 +18,7 @@ Agent swarm (tasks are units; several run at once, so leave ETA to the readout):
     p = Progress('logs/swarm/progress.jsonl', eta=False)
     p.sweep_start(units=['design', 'build', 'test'], deps={'build': ['design'],
                                                            'test': ['build']}, budget_usd=40)
-    p.agent('ada', 'working', task='design')
+    p.agent('ada', 'working', task='design', model='some-model', harness='some-cli')
     p.run_start('design', agent='ada')
     q = p.message('ada', 'question', 'which API version?', needs_human=True)
     p.message('human', 'answer', 'v2', re=q)
@@ -106,9 +106,14 @@ class Progress:
 
     # -- agents
     def agent(self, name: str, state: str, *, task: str | None = None,
-              note: str | None = None, ts: float | None = None) -> None:
-        """state: working | idle | blocked | waiting_human | done | failed.  Transitions only."""
-        kw = {k: v for k, v in (('task', task), ('note', note)) if v is not None}
+              note: str | None = None, model: str | None = None, harness: str | None = None,
+              gpu: str | None = None, host: str | None = None, ts: float | None = None) -> None:
+        """state: working | idle | blocked | waiting_human | done | failed.  Transitions only.
+        model / harness / gpu (a label for a local model's card) / host are sticky: send
+        them once, typically on the agent's first event."""
+        kw = {k: v for k, v in (('task', task), ('note', note), ('model', model),
+                                ('harness', harness), ('gpu', gpu), ('host', host))
+              if v is not None}
         self.emit('agent', ts=ts, agent=name, state=state, **kw)
 
     def message(self, frm: str, kind: str, text: str, *, to: str | None = None,

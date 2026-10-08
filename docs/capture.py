@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import stat
 import subprocess
 import sys
@@ -188,24 +189,25 @@ def main() -> int:
     window_svg(d / 'sweep.json', raw, out / 'compute-window.svg',
                'compute-peek · compute sweep', 200, 50, env)
 
-    # 2. agent swarm, nine days into a campaign
+    # 2. agent swarm: a decompilation campaign, twelve days in (the `demo --kind swarm` spec)
     log = run(PY, PEEK, 'demo-feed', '--swarm', '--progress', d / 'swarm.jsonl', '--history',
-              '9d', '--until-now', '--tasks', '96', '--agents', '7', '--seed', '3', env=env)
-    swarm = {
-        'title': 'docs migration campaign · 7 agents', 'workspace': 'campaign',
-        'cwd': str(d), 'progress': 'swarm.jsonl', 'every': 5, 'stale_after_s': 6 * 3600,
-        'agent_stale_after_s': 12 * 3600, 'budget_usd': 120,
-        'panes': [{'name': 'summary', 'blocks': ['title', 'divider', 'meter', 'cost', 'roster',
-                                                 'stale', 'thought', 'footer']},
-                  {'name': 'board', 'dir': 'down', 'ratio': 0.4,
-                   'blocks': ['feed', 'deps', 'group_table']},
-                  {'name': 'log', 'dir': 'right', 'ratio': 0.66, 'blocks': ['raw']}],
-        'theme': {'icon': '🐝', 'meter_label': 'hive', 'stages': ['scouting', 'building',
-                                                                 'buzzing', 'honey']},
-    }
+              '12d', '--until-now', '--tasks', '150', '--seed', '9', env=env)
+    import importlib.util
+    spec_mod = importlib.util.spec_from_file_location('compute_peek', PEEK)
+    cp = importlib.util.module_from_spec(spec_mod)
+    spec_mod.loader.exec_module(cp)
+    swarm = cp.demo_swarm_spec(str(d), None, gpus)
+    swarm['workspace'] = 'decomp'
     (d / 'swarm.json').write_text(json.dumps(swarm))
+    # a stand-in host: 32 cores, the match stage's recompile+diff fanned out over half of them
+    r = random.Random(5)
+    cores = [r.uniform(70, 99) if i % 2 == 0 else r.uniform(3, 30) for i in range(32)]
+    (d / 'cpu.json').write_text(json.dumps({
+        'all': sum(cores) / len(cores), 'cores': cores, 'load': [17.2, 15.8, 14.1],
+        'mem_used': 41.0, 'mem_total': 128.0}))
+    env2 = {**env, 'PEEK_CPU_SAMPLE': str(d / 'cpu.json')}
     window_svg(d / 'swarm.json', log, out / 'swarm-window.svg',
-               'compute-peek · agent swarm, day 9', 200, 54, env)
+               'compute-peek · decompilation campaign, day 12', 210, 66, env2)
 
     # 3. peek-tui on its own: the atlas and hardware tabs
     if TUI.exists():
