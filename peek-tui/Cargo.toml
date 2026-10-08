@@ -1,0 +1,15 @@
+[package]
+name = "peek-tui"
+version = "0.1.0"
+edition = "2024"
+description = "compute-peek `charts` pane drawn with ratatui (widget reference: github.com/ratatui/ratatui)"
+license = "MIT"
+publish = false
+
+[dependencies]
+ratatui = "0.30"
+serde_json = "1"
+tui-big-text = "0.8"
+
+[profile.release]
+strip = true
